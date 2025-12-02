@@ -39,7 +39,7 @@ async function fillCerfa2031(declarationId, data) {
   await fs.mkdir(OUTPUT_DIR, { recursive: true });
 
   const templatePath = path.join(__dirname, '..', 'templates', '2031-sd_5015.pdf');
-  const outPath     = path.join(OUTPUT_DIR, `cerfa-2031-${declarationId}.pdf`);
+  const outPath      = path.join(OUTPUT_DIR, `cerfa-2031-${declarationId}.pdf`);
 
   // 2) charger le PDF modèle
   const pdfBytes = await fs.readFile(templatePath);
@@ -53,49 +53,74 @@ async function fillCerfa2031(declarationId, data) {
 
   // 3) Remplissage des champs
   try {
-    // Dénomination / nom de l’entreprise
+    // --------------------------------------------------
+    //  BLOC IDENTIFICATION
+    // --------------------------------------------------
+
+    // Dénomination de l’entreprise
+    // 👉 À adapter : mets ici le nom/prénom du loueur si tu as un champ dédié.
     safeSetTextField(
       form,
-      'Désignation de l entreprise', // à adapter selon les noms réels
-      data.nom || data.denomination_entreprise || ''
+      'Dénominationdelentreprise',
+      data.titre || `Location meublée ${data.annee || ''}`
     );
 
-    // Adresse
+    // Adresse de l'entreprise / du bien
     safeSetTextField(
       form,
-      'Adresse_1',
-      data.adresseBien || data.adresse_entreprise || ''
+      'Adressedelentreprise',
+      `${data.adresseBien || ''} ${data.codePostal || ''} ${data.ville || ''}`.trim()
     );
 
+    // Email
     safeSetTextField(
       form,
-      'Codepostal_1',
-      String(data.codePostal || '')
+      'Mél',
+      data.dernierUtilisateurEmail || ''
     );
 
-    safeSetTextField(
-      form,
-      'Ville',
-      data.ville || ''
-    );
-
+    // SIRET (si tu as bien un champ de ce nom dans Acrobat :
+    // vérifie le nom exact dans les logs ou la colonne de droite)
     safeSetTextField(
       form,
       'SIRET',
       data.numroDeSiret || ''
     );
 
+    // Année d'exercice (champ à ajuster selon son nom exact dans le PDF)
     safeSetTextField(
       form,
       'Annéeexercice',
       String(data.annee || '')
     );
 
+    // --------------------------------------------------
+    //  BLOC RÉSULTAT / RÉCAPITULATIF
+    // --------------------------------------------------
+
+    // Résultat fiscal ligne 1 (colonne 3) – nom de champ vu dans ta liste
     safeSetTextField(
       form,
-      'Résultatfiscal',
+      'Tab1col3 Total',
       String(data.resultatFiscal || 0)
     );
+
+    // Tu peux aussi renseigner d’autres colonnes, par ex. bénéfice imposable :
+    safeSetTextField(
+      form,
+      'Tab1col4 Bénéfice imposable col1col2ouDéficit déductible col1col2',
+      String(data.resultatFiscal || 0)
+    );
+
+    // Exemple : total loyers (si tu veux les afficher quelque part dans le formulaire)
+    // (à condition d’avoir créé un champ dédié dans le PDF, par ex. "TotalLoyers")
+    // safeSetTextField(form, 'TotalLoyers', String(data.loyersEncaisses || 0));
+
+    // Exemple : total charges
+    // safeSetTextField(form, 'TotalCharges', String(data.totalCharges || 0));
+
+    // Exemple : intérêts
+    // safeSetTextField(form, 'TotalInterets', String(data.totalInterets || 0));
 
   } catch (e) {
     console.warn('⚠️ Problème global avec les champs PDF (noms à vérifier) :', e.message);
