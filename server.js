@@ -31,6 +31,11 @@ function apiKeyMiddleware(req, res, next) {
 
   const keyFromHeader = req.headers['x-api-key'];
 
+  // 🔍 LOG DEBUG pour comprendre ce qui se passe
+  console.log('[API KEY DEBUG] path  =', req.path);
+  console.log('[API KEY DEBUG] header=', keyFromHeader);
+  console.log('[API KEY DEBUG] env   =', API_KEY);
+
   if (!API_KEY) {
     console.warn('⚠️ Avertissement : aucune API_KEY définie en variable d’environnement.');
     return res.status(500).json({
@@ -40,15 +45,18 @@ function apiKeyMiddleware(req, res, next) {
   }
 
   if (!keyFromHeader || keyFromHeader !== API_KEY) {
+    console.warn('[API KEY DEBUG] Mismatch / clé absente → 401');
     return res.status(401).json({
       ok: false,
       error: 'Accès non autorisé',
     });
   }
 
+  console.log('[API KEY DEBUG] Accès autorisé ✅');
   next();
 }
 
+// On applique le middleware à toutes les routes (sauf /ping, géré plus haut)
 app.use(apiKeyMiddleware);
 
 // ================== ROUTES ==================
