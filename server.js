@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 
 const { createExcelFromTemplate } = require('./services/excelService');
 const { fillCerfa2031 } = require('./services/pdfService');
@@ -17,59 +18,33 @@ app.use(express.json());
 const BASE_URL = process.env.BASE_URL || 'http://localhost:3000';
 console.log('✅ BASE_URL utilisée pour les fichiers :', BASE_URL);
 
-// Clé API pour sécuriser les appels (envoyée par Wix)
+// Clé API pour sécuriser les appels "backend" (POST /api/lmnp)
 const API_KEY = process.env.API_KEY;
 
-// ================== MIDDLEWARE SÉCURITÉ ==================
+// ================== STOCKAGE DES LIENS TÉLÉCHARGEMENT ==================
+// On garde en mémoire la liste des fichiers téléchargeables pendant 5 minutes
+// Map<token, { filePath, type: 'pdf' | 'excel', expiresAt: number }>
+const activeDownloads = new Map();
 
-// Middleware d'authentification par clé API
-function apiKeyMiddleware(req, res, next) {
-  // On laisse /ping accessible sans clé pour le health-check
-  if (req.path === '/ping') {
-    return next();
-  }
+/**
+ * Enregistre un fichier comme téléchargeable pendant quelques minutes,
+ * retourne un token à mettre dans l’URL.
+ */
+function registerDownload(filePath, type) {
+  const token = crypto.randomBytes(24).toString('hex'); // token aléatoire
+  const expiresAt = Date.now() + 5 * 60 * 1000; // 5 minutes
 
-  const keyFromHeader = req.headers['x-api-key'];
+  activeDownloads.set(token, { filePath, type, expiresAt });
 
-  // 🔍 LOG DEBUG pour comprendre ce qui se passe
-  console.log('[API KEY DEBUG] path  =', req.path);
-  console.log('[API KEY DEBUG] header=', keyFromHeader);
-  console.log('[API KEY DEBUG] env   =', API_KEY);
+  // Nettoyage automatique après expiration
+  setTimeout(() => {
+    activeDownloads.delete(token);
+  }, 5 * 60 * 1000);
 
-  if (!API_KEY) {
-    console.warn('⚠️ Avertissement : aucune API_KEY définie en variable d’environnement.');
-    return res.status(500).json({
-      ok: false,
-      error: 'Configuration serveur incomplète',
-    });
-  }
-
-  if (!keyFromHeader || keyFromHeader !== API_KEY) {
-    console.warn('[API KEY DEBUG] Mismatch / clé absente → 401');
-    return res.status(401).json({
-      ok: false,
-      error: 'Accès non autorisé',
-    });
-  }
-
-  console.log('[API KEY DEBUG] Accès autorisé ✅');
-  next();
+  return token;
 }
 
-// On applique le middleware à toutes les routes (sauf /ping, géré plus haut)
-app.use(apiKeyMiddleware);
-
-// ================== ROUTES ==================
-
-// Simple health-check
-app.get('/ping', (req, res) => {
-  res.json({ ok: true, message: 'Backend LMNP fonctionne ✅' });
-});
-
-// Servir les fichiers générés (PDF / Excel)
-app.use('/public', express.static(path.join(__dirname, 'public')));
-
-// Fonction utilitaire : suppression différée d’un fichier
+// Fonction utilitaire : suppression différée d’un fichier sur le disque
 function scheduleFileDeletion(filePath, delayMs = 5 * 60 * 1000) {
   if (!filePath) return;
   setTimeout(() => {
@@ -83,8 +58,56 @@ function scheduleFileDeletion(filePath, delayMs = 5 * 60 * 1000) {
   }, delayMs);
 }
 
-// Endpoint appelé par Wix
-app.post('/api/lmnp', async (req, res) => {
+// ================== MIDDLEWARE SÉCURITÉ ==================
+
+/**
+ * Middleware d’authentification par clé API pour les routes SENSIBLES
+ * (ex: POST /api/lmnp).
+ *
+ * ❗ On NE l’applique PAS aux routes de téléchargement, sinon le navigateur
+ *    ne pourrait pas récupérer le PDF directement via un lien.
+ */
+function apiKeyMiddleware(req, res, next) {
+  const keyFromHeader = req.headers['x-api-key'];
+
+  console.log('[API KEY DEBUG] path =', req.path);
+  console.log('[API KEY DEBUG] header =', keyFromHeader);
+
+  if (!API_KEY) {
+    console.warn('⚠️ Avertissement : aucune API_KEY définie en variable d’environnement.');
+    return res.status(500).json({
+      ok: false,
+      error: 'Configuration serveur incomplète',
+    });
+  }
+
+  if (!keyFromHeader || keyFromHeader !== API_KEY) {
+    return res.status(401).json({
+      ok: false,
+      error: 'Accès non autorisé',
+    });
+  }
+
+  next();
+}
+
+// ================== ROUTES ==================
+
+// Simple health-check
+app.get('/ping', (req, res) => {
+  res.json({ ok: true, message: 'Backend LMNP fonctionne ✅' });
+});
+
+// ⚠️ IMPORTANT : on NE fait PLUS ça :
+// app.use('/public', express.static(path.join(__dirname, 'public')));
+// -> le dossier public N’EST PLUS directement accessible par URL
+// -> les téléchargements se font uniquement via /api/download/... (Option B)
+
+/**
+ * Route principale appelée par Wix pour générer Excel + PDF
+ * Protégée par la clé API
+ */
+app.post('/api/lmnp', apiKeyMiddleware, async (req, res) => {
   try {
     const { declarationId, data } = req.body;
 
@@ -103,23 +126,24 @@ app.post('/api/lmnp', async (req, res) => {
     // 2) Générer le PDF CERFA
     const pdfPath = await fillCerfa2031(declarationId, data);
 
-    // 3) Construire les URLs publiques à renvoyer à Wix
-    const pdfFilename = path.basename(pdfPath);
-    const excelFilename = path.basename(excelPath);
+    // 3) Enregistrer les fichiers comme "téléchargeables" (tokens)
+    const pdfToken = registerDownload(pdfPath, 'pdf');
+    const excelToken = registerDownload(excelPath, 'excel');
 
-    const pdfUrl = `${BASE_URL}/public/pdf/${pdfFilename}`;
-    const excelUrl = `${BASE_URL}/public/excel/${excelFilename}`;
+    // 4) Construire les URLs "protégées" à renvoyer à Wix
+    const pdfUrl = `${BASE_URL}/api/download/pdf/${pdfToken}`;
+    const excelUrl = `${BASE_URL}/api/download/excel/${excelToken}`;
 
-    console.log('✅ Fichiers générés (URLs) :', { pdfUrl, excelUrl });
+    console.log('✅ Liens de téléchargement générés :', { pdfUrl, excelUrl });
 
-    // 4) Réponse à Wix
+    // 5) Réponse à Wix
     res.json({
       ok: true,
       pdfUrl,
       excelUrl,
     });
 
-    // 5) Suppression automatique des fichiers après 5 minutes
+    // 6) Suppression automatique des fichiers après 5 minutes
     scheduleFileDeletion(pdfPath);
     scheduleFileDeletion(excelPath);
   } catch (err) {
@@ -128,6 +152,59 @@ app.post('/api/lmnp', async (req, res) => {
       ok: false,
       error: 'Erreur interne LMNP',
     });
+  }
+});
+
+/**
+ * Route de téléchargement authentifié (Option B)
+ * Exemple d’URL : /api/download/pdf/<token>
+ *
+ * On vérifie :
+ *  - que le token existe
+ *  - qu’il n’est pas expiré
+ *  - que le type (pdf/excel) correspond
+ */
+app.get('/api/download/:type/:token', async (req, res) => {
+  try {
+    const { type, token } = req.params;
+
+    if (type !== 'pdf' && type !== 'excel') {
+      return res.status(400).json({ ok: false, error: 'Type de fichier invalide' });
+    }
+
+    const info = activeDownloads.get(token);
+
+    if (!info) {
+      return res.status(404).json({ ok: false, error: 'Lien de téléchargement invalide ou expiré' });
+    }
+
+    if (info.type !== type) {
+      return res.status(400).json({ ok: false, error: 'Type de fichier non correspondant' });
+    }
+
+    if (Date.now() > info.expiresAt) {
+      activeDownloads.delete(token);
+      return res.status(410).json({ ok: false, error: 'Lien de téléchargement expiré' });
+    }
+
+    const absolutePath = info.filePath;
+    const filename = path.basename(absolutePath);
+
+    console.log(`📤 Téléchargement ${type} demandé :`, filename);
+
+    res.download(absolutePath, filename, (err) => {
+      if (err) {
+        console.error('❌ Erreur lors de l’envoi du fichier :', err.message);
+        if (!res.headersSent) {
+          return res.status(500).json({ ok: false, error: 'Erreur lors du téléchargement' });
+        }
+      }
+    });
+  } catch (err) {
+    console.error('❌ Erreur /api/download :', err.message);
+    if (!res.headersSent) {
+      res.status(500).json({ ok: false, error: 'Erreur interne lors du téléchargement' });
+    }
   }
 });
 
